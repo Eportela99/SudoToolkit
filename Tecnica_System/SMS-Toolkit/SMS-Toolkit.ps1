@@ -961,7 +961,7 @@ BACKUP DATABASE [{{DB}}] TO DISK = @file WITH COPY_ONLY, INIT, STATS = 10, CONTI
 '@
 	},
 	@{
-		Name = 'Repair - rebuild (no data loss)'; Default = $true; Master = $true; SingleUser = $true
+		Name = 'Single User + Repair rebuild (no data loss)'; Default = $true; Master = $true; SingleUser = $true
 		Sql  = @'
 ALTER DATABASE [{{DB}}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
 BEGIN TRY
@@ -985,7 +985,7 @@ PRINT 'CHECKDB found no errors in {{DB}}.';
 '@
 	},
 	@{
-		Name = 'Repair - ALLOW DATA LOSS (last resort)'; Default = $false; Master = $true; SingleUser = $true; Danger = $true
+		Name = 'Emergency + Single User + Repair DATA LOSS'; Default = $false; Master = $true; SingleUser = $true; Danger = $true
 		Sql  = @'
 ALTER DATABASE [{{DB}}] SET EMERGENCY;
 ALTER DATABASE [{{DB}}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
@@ -1005,7 +1005,7 @@ PRINT 'REPAIR_ALLOW_DATA_LOSS finished - check the data in SMS.';
 '@
 	},
 	@{
-		Name = 'Return the database to normal use (online, multi-user)'; Default = $true; Master = $true
+		Name = 'Set back to normal (Online + Multi-User)'; Default = $true; Master = $true
 		Sql  = @'
 IF DATABASEPROPERTYEX(N'{{DB}}', 'Status') <> 'ONLINE' ALTER DATABASE [{{DB}}] SET ONLINE;
 IF DATABASEPROPERTYEX(N'{{DB}}', 'UserAccess') <> 'MULTI_USER' ALTER DATABASE [{{DB}}] SET MULTI_USER;
@@ -1312,22 +1312,22 @@ $script:RunEngineScript = {
 						{
 							# result set -> small text table (max 50 rows)
 							$cols = @(0..($rd.FieldCount - 1) | ForEach-Object { $rd.GetName($_) })
-							$rows = New-Object System.Collections.ArrayList
+							$tblRows = New-Object System.Collections.ArrayList
 							$more = 0
 							while ($rd.Read())
 							{
-								if ($rows.Count -ge 50) { $more++; continue }
+								if ($tblRows.Count -ge 50) { $more++; continue }
 								$vals = @(0..($rd.FieldCount - 1) | ForEach-Object { $v = $rd.GetValue($_); if ($v -is [DBNull]) { '' } else { ([string]$v).Trim() } })
-								[void]$rows.Add($vals)
+								[void]$tblRows.Add($vals)
 							}
-							if ($rows.Count -eq 0) { Emit 'table' ('  (no rows: ' + ($cols -join ', ') + ')') }
+							if ($tblRows.Count -eq 0) { Emit 'table' ('  (no rows: ' + ($cols -join ', ') + ')') }
 							else
 							{
-								$w = @(for ($c = 0; $c -lt $cols.Count; $c++) { [Math]::Min(40, [Math]::Max($cols[$c].Length, (@($rows | ForEach-Object { $_[$c].Length }) | Measure-Object -Maximum).Maximum)) })
+								$w = @(for ($c = 0; $c -lt $cols.Count; $c++) { [Math]::Min(40, [Math]::Max($cols[$c].Length, (@($tblRows | ForEach-Object { $_[$c].Length }) | Measure-Object -Maximum).Maximum)) })
 								$fmtRow = { param ($vals) '  ' + ((0..($cols.Count - 1) | ForEach-Object { $t = [string]$vals[$_]; if ($t.Length -gt $w[$_]) { $t = $t.Substring(0, $w[$_] - 1) + '~' }; $t.PadRight($w[$_]) }) -join '  ') }
 								$lines = @(& $fmtRow $cols)
 								$lines += '  ' + ((0..($cols.Count - 1) | ForEach-Object { '-' * $w[$_] }) -join '  ')
-								foreach ($row in $rows) { $lines += & $fmtRow $row }
+								foreach ($row in $tblRows) { $lines += & $fmtRow $row }
 								if ($more) { $lines += "  ... $more more row(s)" }
 								Emit 'table' ($lines -join "`n")
 							}
@@ -1368,7 +1368,7 @@ $script:RunEngineScript = {
 			$null = $cmd.ExecuteNonQuery()
 			Emit 'info' 'Checked: the database is online and in multi-user mode.'
 		}
-		catch { Emit 'fail' ('Could NOT return the database to multi-user mode: {0} - run "Return the database to normal use".' -f $_.Exception.Message) }
+		catch { Emit 'fail' ('Could NOT return the database to multi-user mode: {0} - run "Set back to normal (Online + Multi-User)".' -f $_.Exception.Message) }
 		finally { $cn.Dispose() }
 	}
 
@@ -20242,7 +20242,7 @@ function Start_SelectedRun
 		if (-not (Show_Dialog 'Run queries' "Run $($sel.Count) quer$(if ($sel.Count -eq 1) { 'y' } else { 'ies' }) on $db ($($script:Db.Role.ToLower()))?`r`n$names" 'Run' 'Cancel')) { Write_Term 'Cancelled.' 'warn'; return }
 	}
 
-	$restore = Expand_Sql ($script:RepairSteps | Where-Object { $_.Name -like 'Return the database*' } | Select-Object -First 1).Sql
+	$restore = Expand_Sql ($script:RepairSteps | Where-Object { $_.Name -like 'Set back to normal*' } | Select-Object -First 1).Sql
 	$sync = [hashtable]::Synchronized(@{
 			Queue = New-Object System.Collections.Concurrent.ConcurrentQueue[object]
 			Cancel = $false; Done = $false; Index = 0; Current = ''; StepStart = [datetime]::Now; Cmd = $null
@@ -20522,6 +20522,9 @@ function Start_App
 			$script:Db = @{ Ok = $false; Role = 'Server' }
 			Update_MiniGhostNav
 			& $snap $form (Join-Path $env:SMSTK_SNAPSHOT 'main.png')
+			Select_Mode 'Repair' -Force
+			& $snap $form (Join-Path $env:SMSTK_SNAPSHOT 'main_repair.png')
+			Select_Mode 'Maintenance' -Force
 			Write-Host ('{0,-24} {1}' -f 'Snapshots', $env:SMSTK_SNAPSHOT)
 		}
 
