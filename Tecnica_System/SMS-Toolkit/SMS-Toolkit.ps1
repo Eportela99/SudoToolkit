@@ -19663,7 +19663,11 @@ function New_MainWindow
 	$head.Controls.Add($sub)
 	$script:UI.Sub = $sub
 	# Dock=Right: the last one added sits furthest right -> minimize, maximize, close (X on the far right)
-	foreach ($spec in @(@('min', [char]0x2014), @('max', [char]0x25A1), @('close', [char]0x2715)))
+	# Windows' own caption glyphs (Segoe MDL2 Assets, Windows 10/11) so the three buttons match in size;
+	# plain Segoe UI characters as a fallback
+	$mdl2 = (New-Object System.Drawing.Text.InstalledFontCollection).Families | Where-Object { $_.Name -eq 'Segoe MDL2 Assets' } | Select-Object -First 1
+	$capSpecs = if ($mdl2) { @(@('min', [char]0xE921), @('max', [char]0xE922), @('close', [char]0xE8BB)) } else { @(@('min', [char]0x2014), @('max', [char]0x25A1), @('close', [char]0x2715)) }
+	foreach ($spec in $capSpecs)
 	{
 		$b = New-Object System.Windows.Forms.Button
 		$b.Text = [string]$spec[1]
@@ -19674,7 +19678,7 @@ function New_MainWindow
 		$b.FlatAppearance.BorderSize = 0
 		$b.ForeColor = $T.Text
 		$b.BackColor = $T.Side
-		$b.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+		$b.Font = if ($mdl2) { New-Object System.Drawing.Font('Segoe MDL2 Assets', 9) } else { New-Object System.Drawing.Font('Segoe UI', 10) }
 		$b.FlatAppearance.MouseOverBackColor = if ($spec[0] -eq 'close') { $T.Danger } else { $T.CardHi }
 		$b.Add_Click({
 				switch ($this.Tag)
