@@ -6,7 +6,7 @@ Windows tools written in plain PowerShell 5.1 (WinForms GUI). They need no insta
 
 | Tool | What it does | Run it |
 |---|---|---|
-| [SMS-Toolkit](Tecnica_System/SMS-Toolkit) | Store maintenance toolkit for SMS store servers and lanes: database maintenance, Mini Ghost, scheduler, scales, remote lane tools, export, Windows repair. Asks for admin rights. | `Run-SMS-Toolkit.bat` |
+| [SMS-Toolkit](Tecnica_System/SMS-Toolkit) | Store maintenance toolkit for SMS store servers and lanes: database maintenance, Mini Ghost, scheduler, scales, remote lane tools (from the server or any lane), export, Windows repair, others (POS settings, Desktop clean-up, journal repair). Asks for admin rights. | `Run-SMS-Toolkit.bat` |
 | [TechRoute](Tecnica_System/TechRoute) | Technician route planner: reads the Helpdesk *Tickets Report* (.xlsx), lists your open tickets, builds a Google Maps route from the office (by open date, by distance or custom) and prints one service form per store. | `Run-TechRoute.bat` |
 
 ### Quick start
