@@ -1,0 +1,2 @@
+# Keep files byte-for-byte (PowerShell 5.1 scripts rely on their encoding, .bat needs CRLF)
+* -text
