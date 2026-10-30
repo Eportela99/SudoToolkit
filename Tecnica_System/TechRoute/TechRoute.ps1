@@ -19,7 +19,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.IO.Compressi
 #region Config
 $script:App = @{
     Name    = 'TechRoute'
-    Version = '1.1.0'
+    Version = '1.2.0'
     Root    = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent ([Environment]::GetCommandLineArgs()[0]) }
 }
 $script:App.Assets = Join-Path $script:App.Root 'Assets'
@@ -244,6 +244,314 @@ function Get_MapsLinks($stops) {
         $origin = $dest
     }
     return , $links
+}
+#endregion
+
+#region QR code (offline encoder, byte mode, ECC L..H auto)
+# Built in so the route link (customer addresses) never goes to an online QR service.
+# Compiled on first use; follows the QR Code Model 2 spec (ISO/IEC 18004).
+$script:QrSource = @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Text;
+
+public static class TechRouteQr {
+    // index = ECC level (L, M, Q, H), then version
+    static readonly int[,] EccPerBlock = {
+        {-1, 7,10,15,20,26,18,20,24,30,18,20,24,26,30,22,24,28,30,28,28,28,28,30,30,26,28,30,30,30,30,30,30,30,30,30,30,30,30,30,30},
+        {-1,10,16,26,18,24,16,18,22,22,26,30,22,22,24,24,28,28,26,26,26,26,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28},
+        {-1,13,22,18,26,18,24,18,22,20,24,28,26,24,20,30,24,28,28,26,30,28,30,30,30,30,28,30,30,30,30,30,30,30,30,30,30,30,30,30,30},
+        {-1,17,28,22,16,22,28,26,26,24,28,24,28,22,24,24,30,28,28,26,28,30,24,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30}};
+    static readonly int[,] NumBlocks = {
+        {-1,1,1,1,1,1,2,2,2,2,4,4,4,4,4,6,6,6,6,7,8,8,9,9,10,12,12,12,13,14,15,16,17,18,19,19,20,21,22,24,25},
+        {-1,1,1,1,2,2,4,4,4,5,5,5,8,9,9,10,10,11,13,14,16,17,17,18,20,21,23,25,26,28,29,31,33,35,37,38,40,43,45,47,49},
+        {-1,1,1,2,2,4,4,6,6,8,8,8,10,12,16,12,17,16,18,21,20,23,23,25,27,29,34,34,35,38,40,43,45,48,51,53,56,59,62,65,68},
+        {-1,1,1,2,4,4,4,5,6,8,8,11,11,16,16,18,16,19,21,25,25,25,34,30,32,35,37,40,42,45,48,51,54,57,60,63,66,70,74,77,81}};
+    static readonly int[] EclFormat = { 1, 0, 3, 2 };
+
+    static int size, version, ecl;
+    static bool[,] dark, isFn;
+
+    public static int Version { get { return version; } }
+
+    // true = dark module, indexed [y, x]
+    public static bool[,] Encode(string text) {
+        byte[] data = Encoding.UTF8.GetBytes(text);
+        version = 0;
+        for (int v = 1; v <= 40; v++) {
+            if (DataBits(data.Length, v) <= DataCodewords(v, 0) * 8) { version = v; break; }
+        }
+        if (version == 0) throw new ArgumentException("Link too long for a QR code (" + data.Length + " bytes).");
+        ecl = 0;
+        for (int e = 1; e <= 3; e++) { if (DataBits(data.Length, version) <= DataCodewords(version, e) * 8) ecl = e; }
+
+        // data bits: byte mode, length, payload, terminator, padding
+        var bits = new List<bool>();
+        AppendBits(bits, 4, 4);
+        AppendBits(bits, data.Length, version <= 9 ? 8 : 16);
+        foreach (byte b in data) AppendBits(bits, b, 8);
+        int capacity = DataCodewords(version, ecl) * 8;
+        AppendBits(bits, 0, Math.Min(4, capacity - bits.Count));
+        AppendBits(bits, 0, (8 - bits.Count % 8) % 8);
+        for (int pad = 0xEC; bits.Count < capacity; pad ^= 0xEC ^ 0x11) AppendBits(bits, pad, 8);
+        byte[] codewords = new byte[bits.Count / 8];
+        for (int i = 0; i < bits.Count; i++) if (bits[i]) codewords[i >> 3] |= (byte)(0x80 >> (i & 7));
+
+        size = version * 4 + 17;
+        dark = new bool[size, size]; isFn = new bool[size, size];
+        DrawFunctionPatterns();
+        DrawCodewords(AddEccAndInterleave(codewords));
+
+        int best = 0, bestPenalty = int.MaxValue;
+        for (int m = 0; m < 8; m++) {
+            ApplyMask(m); DrawFormatBits(m);
+            int p = Penalty();
+            if (p < bestPenalty) { best = m; bestPenalty = p; }
+            ApplyMask(m);   // xor again = undo
+        }
+        ApplyMask(best); DrawFormatBits(best);
+        return dark;
+    }
+
+    // black on white with a 4-module quiet zone; scale = pixels per module
+    public static Bitmap Render(string text, int scale) {
+        bool[,] m = Encode(text);
+        int n = m.GetLength(0), px = (n + 8) * scale;
+        var bmp = new Bitmap(px, px);
+        using (var g = Graphics.FromImage(bmp)) {
+            g.Clear(Color.White);
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < n; x++)
+                    if (m[y, x]) g.FillRectangle(Brushes.Black, (x + 4) * scale, (y + 4) * scale, scale, scale);
+        }
+        return bmp;
+    }
+
+    public static int ModuleCount(string text) {
+        byte[] data = Encoding.UTF8.GetBytes(text);
+        for (int v = 1; v <= 40; v++) if (DataBits(data.Length, v) <= DataCodewords(v, 0) * 8) return v * 4 + 17;
+        throw new ArgumentException("Link too long for a QR code (" + data.Length + " bytes).");
+    }
+
+    static int DataBits(int len, int v) { return 4 + (v <= 9 ? 8 : 16) + len * 8; }
+
+    static void AppendBits(List<bool> bits, int val, int len) {
+        for (int i = len - 1; i >= 0; i--) bits.Add(((val >> i) & 1) != 0);
+    }
+
+    static int RawDataModules(int v) {
+        int r = (16 * v + 128) * v + 64;
+        if (v >= 2) {
+            int na = v / 7 + 2;
+            r -= (25 * na - 10) * na - 55;
+            if (v >= 7) r -= 36;
+        }
+        return r;
+    }
+
+    static int DataCodewords(int v, int e) { return RawDataModules(v) / 8 - EccPerBlock[e, v] * NumBlocks[e, v]; }
+
+    static void SetFn(int x, int y, bool d) { dark[y, x] = d; isFn[y, x] = true; }
+
+    static void DrawFunctionPatterns() {
+        for (int i = 0; i < size; i++) { SetFn(6, i, i % 2 == 0); SetFn(i, 6, i % 2 == 0); }
+        DrawFinder(3, 3); DrawFinder(size - 4, 3); DrawFinder(3, size - 4);
+        int[] al = AlignmentPositions();
+        int na = al.Length;
+        for (int i = 0; i < na; i++)
+            for (int j = 0; j < na; j++)
+                if (!(i == 0 && j == 0 || i == 0 && j == na - 1 || i == na - 1 && j == 0)) DrawAlignment(al[i], al[j]);
+        DrawFormatBits(0);   // reserve; real bits drawn after masking
+        DrawVersion();
+    }
+
+    static void DrawFinder(int x, int y) {
+        for (int dy = -4; dy <= 4; dy++)
+            for (int dx = -4; dx <= 4; dx++) {
+                int dist = Math.Max(Math.Abs(dx), Math.Abs(dy)), xx = x + dx, yy = y + dy;
+                if (xx >= 0 && xx < size && yy >= 0 && yy < size) SetFn(xx, yy, dist != 2 && dist != 4);
+            }
+    }
+
+    static void DrawAlignment(int x, int y) {
+        for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++) SetFn(x + dx, y + dy, Math.Max(Math.Abs(dx), Math.Abs(dy)) != 1);
+    }
+
+    static int[] AlignmentPositions() {
+        if (version == 1) return new int[0];
+        int na = version / 7 + 2;
+        int step = (version * 8 + na * 3 + 5) / (na * 4 - 4) * 2;
+        int[] r = new int[na];
+        r[0] = 6;
+        for (int i = na - 1, pos = size - 7; i >= 1; i--, pos -= step) r[i] = pos;
+        return r;
+    }
+
+    static bool Bit(int x, int i) { return ((x >> i) & 1) != 0; }
+
+    static void DrawFormatBits(int mask) {
+        int data = EclFormat[ecl] << 3 | mask, rem = data;
+        for (int i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >> 9) * 0x537);
+        int bits = (data << 10 | rem) ^ 0x5412;
+        for (int i = 0; i <= 5; i++) SetFn(8, i, Bit(bits, i));
+        SetFn(8, 7, Bit(bits, 6)); SetFn(8, 8, Bit(bits, 7)); SetFn(7, 8, Bit(bits, 8));
+        for (int i = 9; i < 15; i++) SetFn(14 - i, 8, Bit(bits, i));
+        for (int i = 0; i < 8; i++) SetFn(size - 1 - i, 8, Bit(bits, i));
+        for (int i = 8; i < 15; i++) SetFn(8, size - 15 + i, Bit(bits, i));
+        SetFn(8, size - 8, true);
+    }
+
+    static void DrawVersion() {
+        if (version < 7) return;
+        int rem = version;
+        for (int i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >> 11) * 0x1F25);
+        int bits = version << 12 | rem;
+        for (int i = 0; i < 18; i++) {
+            bool b = Bit(bits, i);
+            int a = size - 11 + i % 3, c = i / 3;
+            SetFn(a, c, b); SetFn(c, a, b);
+        }
+    }
+
+    static byte[] AddEccAndInterleave(byte[] data) {
+        int nb = NumBlocks[ecl, version], eccLen = EccPerBlock[ecl, version];
+        int raw = RawDataModules(version) / 8, numShort = nb - raw % nb, shortLen = raw / nb;
+        byte[] div = RsDivisor(eccLen);
+        var blocks = new List<byte[]>();
+        for (int i = 0, k = 0; i < nb; i++) {
+            int datLen = shortLen - eccLen + (i < numShort ? 0 : 1);
+            byte[] dat = new byte[datLen];
+            Array.Copy(data, k, dat, 0, datLen);
+            k += datLen;
+            byte[] ecc = RsRemainder(dat, div);
+            byte[] block = new byte[shortLen + 1];
+            Array.Copy(dat, 0, block, 0, datLen);   // short blocks keep a gap at index datLen
+            Array.Copy(ecc, 0, block, shortLen + 1 - eccLen, eccLen);
+            blocks.Add(block);
+        }
+        var result = new List<byte>();
+        for (int i = 0; i < shortLen + 1; i++)
+            for (int j = 0; j < nb; j++)
+                if (i != shortLen - eccLen || j >= numShort) result.Add(blocks[j][i]);
+        return result.ToArray();
+    }
+
+    static byte[] RsDivisor(int degree) {
+        byte[] r = new byte[degree];
+        r[degree - 1] = 1;
+        int root = 1;
+        for (int i = 0; i < degree; i++) {
+            for (int j = 0; j < degree; j++) {
+                r[j] = (byte)RsMul(r[j], root);
+                if (j + 1 < degree) r[j] ^= r[j + 1];
+            }
+            root = RsMul(root, 0x02);
+        }
+        return r;
+    }
+
+    static byte[] RsRemainder(byte[] data, byte[] div) {
+        byte[] r = new byte[div.Length];
+        foreach (byte b in data) {
+            int factor = b ^ r[0];
+            Array.Copy(r, 1, r, 0, r.Length - 1);
+            r[r.Length - 1] = 0;
+            for (int i = 0; i < r.Length; i++) r[i] ^= (byte)RsMul(div[i], factor);
+        }
+        return r;
+    }
+
+    static int RsMul(int x, int y) {
+        int z = 0;
+        for (int i = 7; i >= 0; i--) {
+            z = (z << 1) ^ ((z >> 7) * 0x11D);
+            z ^= ((y >> i) & 1) * x;
+        }
+        return z;
+    }
+
+    static void DrawCodewords(byte[] data) {
+        int i = 0;
+        for (int right = size - 1; right >= 1; right -= 2) {
+            if (right == 6) right = 5;
+            for (int vert = 0; vert < size; vert++)
+                for (int j = 0; j < 2; j++) {
+                    int x = right - j;
+                    bool upward = ((right + 1) & 2) == 0;
+                    int y = upward ? size - 1 - vert : vert;
+                    if (!isFn[y, x] && i < data.Length * 8) {
+                        dark[y, x] = Bit(data[i >> 3], 7 - (i & 7));
+                        i++;
+                    }
+                }
+        }
+    }
+
+    static void ApplyMask(int mask) {
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++) {
+                bool inv;
+                switch (mask) {
+                    case 0: inv = (x + y) % 2 == 0; break;
+                    case 1: inv = y % 2 == 0; break;
+                    case 2: inv = x % 3 == 0; break;
+                    case 3: inv = (x + y) % 3 == 0; break;
+                    case 4: inv = (x / 3 + y / 2) % 2 == 0; break;
+                    case 5: inv = x * y % 2 + x * y % 3 == 0; break;
+                    case 6: inv = (x * y % 2 + x * y % 3) % 2 == 0; break;
+                    default: inv = ((x + y) % 2 + x * y % 3) % 2 == 0; break;
+                }
+                if (inv && !isFn[y, x]) dark[y, x] = !dark[y, x];
+            }
+    }
+
+    static bool At(int x, int y, bool rows) { return rows ? dark[y, x] : dark[x, y]; }
+
+    // spec penalty rules N1-N4 (lower = easier to scan)
+    static int Penalty() {
+        int p = 0, darkCount = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            bool rows = pass == 0;
+            for (int a = 0; a < size; a++) {
+                int run = 1;
+                for (int b = 1; b < size; b++) {
+                    if (At(b, a, rows) == At(b - 1, a, rows)) {
+                        run++;
+                        if (run == 5) p += 3; else if (run > 5) p++;
+                    } else run = 1;
+                }
+                // 1:1:3:1:1 finder look-alike with 4 light modules on one side
+                for (int b = 0; b + 10 < size; b++) {
+                    bool core = At(b + 4, a, rows) && !At(b + 5, a, rows) && At(b + 6, a, rows) && At(b + 7, a, rows) && At(b + 8, a, rows) && !At(b + 9, a, rows) && At(b + 10, a, rows);
+                    bool core2 = At(b, a, rows) && !At(b + 1, a, rows) && At(b + 2, a, rows) && At(b + 3, a, rows) && At(b + 4, a, rows) && !At(b + 5, a, rows) && At(b + 6, a, rows);
+                    if (core && !At(b, a, rows) && !At(b + 1, a, rows) && !At(b + 2, a, rows) && !At(b + 3, a, rows)) p += 40;
+                    if (core2 && !At(b + 7, a, rows) && !At(b + 8, a, rows) && !At(b + 9, a, rows) && !At(b + 10, a, rows)) p += 40;
+                }
+            }
+        }
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++) {
+                if (dark[y, x]) darkCount++;
+                if (x + 1 < size && y + 1 < size) {
+                    bool c = dark[y, x];
+                    if (c == dark[y, x + 1] && c == dark[y + 1, x] && c == dark[y + 1, x + 1]) p += 3;
+                }
+            }
+        int total = size * size;
+        int k = (Math.Abs(darkCount * 20 - total * 10) + total - 1) / total - 1;
+        p += Math.Max(0, k) * 10;
+        return p;
+    }
+}
+'@
+
+# Returns a QR code bitmap of $text, about $targetPx wide (whole pixels per module).
+function New_QrBitmap([string]$text, [int]$targetPx = 480) {
+    if (-not ('TechRouteQr' -as [type])) { Add-Type -TypeDefinition $script:QrSource -ReferencedAssemblies System.Drawing }
+    $scale = [Math]::Max(2, [Math]::Floor($targetPx / ([TechRouteQr]::ModuleCount($text) + 8)))
+    return [TechRouteQr]::Render($text, $scale)
 }
 #endregion
 
@@ -535,6 +843,48 @@ function Show_CustomPicker {
     return , $picked
 }
 
+# QR code of the Google Maps link(s), to open the route on the phone. One code per link part.
+function Show_RouteQr($links) {
+    try { $images = @($links | ForEach-Object { New_QrBitmap $_ 480 }) }
+    catch { Show_Message "Could not make the QR code:`n$($_.Exception.Message)" 'QR code' 'Error'; return }
+    $f = New_Form 'Route QR code' ([Math]::Max(560, 300 + 102 * $images.Count)) 640
+    $f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false
+    $pic = New-Object Windows.Forms.PictureBox
+    $pic.Dock = 'Fill'; $pic.SizeMode = 'CenterImage'; $pic.BackColor = $script:Theme.Bg
+    $state = @{ Index = 0 }
+    $msg = 'Scan with the phone camera to open the route in Google Maps.'
+    $info = New_Label $msg $script:Theme.Font $script:Theme.Muted
+    $info.Dock = 'Top'; $info.AutoSize = $false; $info.Height = 40; $info.TextAlign = 'MiddleCenter'
+    $bar = New_BottomBar
+    $close = New_Button 'Close' 110 44 $script:Theme.Bold; $close.DialogResult = 'Cancel'
+    $save = New_Button 'Save image' 140 44 $script:Theme.Bold
+    $save.Add_Click({
+        $dlg = New-Object Windows.Forms.SaveFileDialog
+        $dlg.Filter = 'PNG image (*.png)|*.png'
+        $part = if ($images.Count -gt 1) { " part $($state.Index + 1)" } else { '' }
+        $dlg.FileName = "TechRoute $(Get-Date -Format 'yyyy-MM-dd')$part.png"
+        if ($dlg.ShowDialog($f) -eq 'OK') { $images[$state.Index].Save($dlg.FileName, [Drawing.Imaging.ImageFormat]::Png) }
+        $dlg.Dispose()
+    }.GetNewClosure())
+    $bar.Controls.AddRange(@($close, $save))
+    $show = {
+        param([int]$i)
+        $state.Index = $i; $pic.Image = $images[$i]
+        if ($images.Count -gt 1) { $info.Text = "Part $($i + 1) of $($images.Count) - $msg" }
+    }.GetNewClosure()
+    if ($images.Count -gt 1) {
+        for ($p = $images.Count - 1; $p -ge 0; $p--) {
+            $b = New_Button "Part $($p + 1)" 90 44 $script:Theme.Bold; $b.ForeColor = $script:Theme.Brand; $b.Tag = $p
+            $b.Add_Click({ param($s) & $show $s.Tag }.GetNewClosure())
+            $bar.Controls.Add($b)
+        }
+    }
+    & $show 0
+    $f.Controls.AddRange(@($pic, $info, $bar)); $f.CancelButton = $close
+    $null = $f.ShowDialog(); $f.Dispose()
+    $images | ForEach-Object { $_.Dispose() }
+}
+
 function Show_Route($stops, [string]$mode, $skipped) {
     $links = Get_MapsLinks $stops
     $f = New_Form "Route - $mode" 1180 600
@@ -566,9 +916,10 @@ function Show_Route($stops, [string]$mode, $skipped) {
     $close = New_Button 'Close' 120 44 $script:Theme.Bold; $close.Add_Click({ $f.Close() })
     $copy = New_Button 'Copy link' 140 44 $script:Theme.Bold
     $copy.Add_Click({ [Windows.Forms.Clipboard]::SetText(($links -join "`r`n")); $copy.Text = 'Copied!' }.GetNewClosure())
+    $qr = New_Button 'QR code' 120 44 $script:Theme.Bold; $qr.Tag = $links; $qr.Add_Click({ param($s) Show_RouteQr @($s.Tag) })
     $print = New_Button 'Print forms' 140 44 $script:Theme.Bold; $print.Add_Click({ Invoke_PrintForms $stops })
     $preview = New_Button 'Preview' 110 44 $script:Theme.Bold; $preview.Add_Click({ Invoke_PrintForms $stops -Preview })
-    $bar.Controls.AddRange(@($close, $copy, $print, $preview))
+    $bar.Controls.AddRange(@($close, $copy, $qr, $print, $preview))
     for ($p = $links.Count - 1; $p -ge 0; $p--) {
         $label = if ($links.Count -gt 1) { "Google Maps part $($p + 1)" } else { 'Open in Google Maps' }
         $b = New_Button $label 210 44 $script:Theme.Bold; $b.ForeColor = $script:Theme.Brand
@@ -715,7 +1066,17 @@ if ($SelfTest) {
     "--- By Distance, All:"
     $stops = New_Stops $open
     $stops | ForEach-Object { '{0,5} mi  {1}  [{2}]' -f $_.Miles, $_.Customer, (($_.Tickets | ForEach-Object Number) -join ',') }
-    Get_MapsLinks $stops
+    $links = Get_MapsLinks $stops
+    $links
+    # QR codes of the links (saved as qr_N.png when TECHROUTE_SNAPSHOT is set)
+    $i = 0
+    foreach ($l in $links) {
+        $i++
+        $bmp = New_QrBitmap $l 480
+        "QR part ${i}: version $([TechRouteQr]::Version), $($bmp.Width) px, $($l.Length) chars"
+        if ($env:TECHROUTE_SNAPSHOT) { $bmp.Save((Join-Path $env:TECHROUTE_SNAPSHOT "qr_$i.png")) }
+        $bmp.Dispose()
+    }
     # render the ticket forms to PNG (TECHROUTE_SNAPSHOT=<dir>) to check the layout without printing
     if ($env:TECHROUTE_SNAPSHOT) {
         $i = 0
